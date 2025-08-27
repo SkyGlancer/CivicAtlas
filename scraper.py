@@ -45,7 +45,8 @@ class CivicAtlasScraper:
             'Urban Local Body Name',
             'Urban Local Body Type',
             'District',
-            'State'
+            'State',
+            'LGD Code'
         ]
 
     def scrape_all_data(self) -> bool:
@@ -168,7 +169,8 @@ class CivicAtlasScraper:
             # Process each urban body
             for i, urban_body in enumerate(urban_bodies, 1):
                 try:
-                    print(f"   🔄 Processing {urban_body['name']} ({i}/{len(urban_bodies)})", end=' ')
+                    district_info = f"[{urban_body.get('district', 'Unknown')}]" if urban_body.get('district') else ""
+                    print(f"   🔄 Processing {urban_body['name']} {district_info} ({i}/{len(urban_bodies)})", end=' ')
                     
                     wards = self.get_wards_from_urban_body(urban_body['url'])
                     
@@ -403,28 +405,40 @@ class CivicAtlasScraper:
             if not any(cell_texts):
                 return None
             
-            ward_info = {'ward_number': '', 'ward_name': ''}
+            ward_info = {'ward_number': '', 'ward_name': '', 'lgd_code': ''}
             
-            # Try different patterns to identify ward number and name
+            # Expected columns: #, Ward Name, Ward No, LGD Code
+            # Try to map based on position and content
             for i, text in enumerate(cell_texts):
                 if not text:
                     continue
                     
-                # Check if this looks like a ward number (numeric or contains 'Ward No')
-                if text.isdigit() or re.match(r'^\d+$', text):
+                # Column 0: Serial number (skip)
+                if i == 0 and text.isdigit():
+                    continue
+                # Column 1: Ward Name
+                elif i == 1 and 'ward' in text.lower():
+                    ward_info['ward_name'] = text
+                # Column 2: Ward Number
+                elif i == 2 and text.isdigit():
                     ward_info['ward_number'] = text
-                elif re.search(r'ward\s*no\.?\s*(\d+)', text, re.IGNORECASE):
+                # Column 3: LGD Code
+                elif i == 3 and text.isdigit():
+                    ward_info['lgd_code'] = text
+                # Fallback: try to identify based on content
+                elif text.isdigit() and len(text) >= 3 and not ward_info['lgd_code']:
+                    ward_info['lgd_code'] = text
+                elif text.isdigit() and len(text) <= 2 and not ward_info['ward_number']:
+                    ward_info['ward_number'] = text
+                elif 'ward' in text.lower() and len(text) > 5 and not ward_info['ward_name']:
+                    ward_info['ward_name'] = text
+                elif re.search(r'ward\s*no\.?\s*(\d+)', text, re.IGNORECASE) and not ward_info['ward_name']:
                     match = re.search(r'ward\s*no\.?\s*(\d+)', text, re.IGNORECASE)
                     ward_info['ward_number'] = match.group(1)
                     ward_info['ward_name'] = text
-                elif 'ward' in text.lower() and len(text) > 5:
-                    ward_info['ward_name'] = text
-                elif i > 0 and not ward_info['ward_name'] and len(text) > 3:
-                    # If we haven't found a ward name yet and this is a substantial text
-                    ward_info['ward_name'] = text
             
             # Validate that we have at least some ward information
-            if ward_info['ward_number'] or ward_info['ward_name']:
+            if ward_info['ward_number'] or ward_info['ward_name'] or ward_info['lgd_code']:
                 return ward_info
                 
             return None
@@ -457,7 +471,8 @@ class CivicAtlasScraper:
                         'Urban Local Body Name': urban_body['name'],
                         'Urban Local Body Type': urban_body['type'],
                         'District': urban_body.get('district', ''),
-                        'State': state_name
+                        'State': state_name,
+                        'LGD Code': ward.get('lgd_code', '')
                     })
                     
         except Exception as e:
