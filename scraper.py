@@ -12,24 +12,21 @@ import re
 from urllib.parse import urljoin, urlparse
 from typing import List, Dict, Optional, Tuple
 import os
+import concurrent.futures
+import threading
 from utils import retry_on_failure, normalize_text, progress_bar
 
 class CivicAtlasScraper:
     def __init__(self):
         self.base_url = "https://civicatlas.in"
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive'
-        })
-        
         self.logger = logging.getLogger(__name__)
-        self.output_file = "civicatlas_urban_bodies_wards.csv"
+        self.output_dir = "civicatlas_data"
         
-        # Statistics tracking
+        # Create output directory
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+        
+        # Thread-safe statistics tracking
         self.stats = {
             'states_processed': 0,
             'urban_bodies_processed': 0,
@@ -37,6 +34,7 @@ class CivicAtlasScraper:
             'errors': 0,
             'skipped': 0
         }
+        self.stats_lock = threading.Lock()
         
         # CSV fieldnames
         self.csv_fieldnames = [
@@ -50,7 +48,7 @@ class CivicAtlasScraper:
         ]
 
     def scrape_all_data(self) -> bool:
-        """Main scraping function that orchestrates the entire process"""
+        """Main scraping function that orchestrates the entire process with parallel processing"""
         try:
             # Step 1: Get all state URLs
             self.logger.info("Starting to scrape CivicAtlas.in")
@@ -64,29 +62,37 @@ class CivicAtlasScraper:
                 
             print(f"✅ Found {len(state_urls)} states/UTs")
             
-            # Initialize CSV file
-            self._initialize_csv_file()
+            # Step 2: Process states in parallel
+            print("\n🏛️  Step 2: Processing states in parallel (up to 5 concurrent states)...")
+            print(f"📁 Data will be saved to separate files in '{self.output_dir}/' folder\n")
             
-            # Step 2: Process each state
-            print("\n🏛️  Step 2: Processing urban local bodies for each state...")
+            # Use ThreadPoolExecutor for parallel processing
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                # Submit all state processing tasks
+                future_to_state = {
+                    executor.submit(self.process_state_to_file, state_name, state_url): state_name 
+                    for state_name, state_url in state_urls.items()
+                }
+                
+                # Process completed futures
+                for future in concurrent.futures.as_completed(future_to_state):
+                    state_name = future_to_state[future]
+                    try:
+                        future.result()
+                        with self.stats_lock:
+                            self.stats['states_processed'] += 1
+                        print(f"✅ Completed: {state_name}")
+                    except Exception as e:
+                        with self.stats_lock:
+                            self.stats['errors'] += 1
+                        self.logger.error(f"Error processing state {state_name}: {str(e)}")
+                        print(f"❌ Failed: {state_name} - {str(e)}")
             
-            for i, (state_name, state_url) in enumerate(state_urls.items(), 1):
-                try:
-                    print(f"\n📍 Processing {state_name} ({i}/{len(state_urls)})")
-                    self.process_state(state_name, state_url)
-                    self.stats['states_processed'] += 1
-                    
-                    # Respectful delay between states
-                    if i < len(state_urls):
-                        time.sleep(2)
-                        
-                except Exception as e:
-                    self.logger.error(f"Error processing state {state_name}: {str(e)}")
-                    self.stats['errors'] += 1
-                    print(f"   ⚠️  Error processing {state_name}: {str(e)}")
-                    continue
+            print(f"\n🎉 Parallel scraping completed! Processed {self.stats['states_processed']} states")
             
-            print(f"\n🎉 Scraping completed! Processed {self.stats['states_processed']} states")
+            # Create consolidated file
+            self._create_consolidated_file()
+            
             return True
             
         except Exception as e:
@@ -94,11 +100,24 @@ class CivicAtlasScraper:
             print(f"❌ Fatal error: {str(e)}")
             return False
 
+    def _create_session(self) -> requests.Session:
+        """Create a new session with appropriate headers"""
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive'
+        })
+        return session
+
     @retry_on_failure(max_retries=3, delay=2)
     def get_state_urban_body_urls(self) -> Dict[str, str]:
         """Extract all state URLs that link to urban local bodies listings"""
         try:
-            response = self.session.get(self.base_url, timeout=30)
+            session = self._create_session()
+            response = session.get(self.base_url, timeout=30)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -155,53 +174,76 @@ class CivicAtlasScraper:
             self.logger.warning(f"Error extracting state name from link: {str(e)}")
             return None
 
-    def process_state(self, state_name: str, state_url: str):
-        """Process all urban local bodies for a given state"""
+    def process_state_to_file(self, state_name: str, state_url: str):
+        """Process all urban local bodies for a given state and save to separate file"""
+        session = self._create_session()
+        
+        # Create safe filename
+        safe_state_name = re.sub(r'[<>:"/\\|?*]', '_', state_name)
+        output_file = os.path.join(self.output_dir, f"{safe_state_name}.csv")
+        
         try:
-            urban_bodies = self.get_urban_bodies_from_state(state_name, state_url)
+            print(f"🚀 Started: {state_name}")
+            
+            urban_bodies = self.get_urban_bodies_from_state(state_name, state_url, session)
             
             if not urban_bodies:
-                print(f"   📭 No urban bodies found for {state_name}")
+                print(f"📭 No urban bodies found for {state_name}")
+                # Create empty file with headers
+                self._initialize_state_csv_file(output_file)
                 return
-                
-            print(f"   🏘️  Found {len(urban_bodies)} urban local bodies")
+            
+            print(f"🏘️  {state_name}: Found {len(urban_bodies)} urban local bodies")
+            
+            # Initialize CSV file for this state
+            self._initialize_state_csv_file(output_file)
             
             # Process each urban body
+            state_wards = 0
+            state_bodies = 0
+            state_skipped = 0
+            
             for i, urban_body in enumerate(urban_bodies, 1):
                 try:
                     district_info = f"[{urban_body.get('district', 'Unknown')}]" if urban_body.get('district') else ""
-                    print(f"   🔄 Processing {urban_body['name']} {district_info} ({i}/{len(urban_bodies)})", end=' ')
                     
-                    wards = self.get_wards_from_urban_body(urban_body['url'])
+                    wards = self.get_wards_from_urban_body(urban_body['url'], session)
                     
                     if wards:
-                        self._save_wards_to_csv(wards, urban_body, state_name)
-                        self.stats['wards_extracted'] += len(wards)
-                        print(f"✅ {len(wards)} wards")
+                        self._save_wards_to_state_csv(wards, urban_body, state_name, output_file)
+                        state_wards += len(wards)
+                        print(f"✅ {state_name}: {urban_body['name']} {district_info} - {len(wards)} wards")
                     else:
-                        print("⚠️ No wards found")
-                        self.stats['skipped'] += 1
+                        state_skipped += 1
                     
-                    self.stats['urban_bodies_processed'] += 1
+                    state_bodies += 1
                     
-                    # Respectful delay between requests
-                    time.sleep(1)
+                    # Small delay between requests to be respectful
+                    time.sleep(0.5)
                     
                 except Exception as e:
-                    self.logger.error(f"Error processing urban body {urban_body.get('name', 'Unknown')}: {str(e)}")
-                    print(f"❌ Error")
-                    self.stats['errors'] += 1
+                    self.logger.error(f"Error processing urban body {urban_body.get('name', 'Unknown')} in {state_name}: {str(e)}")
+                    with self.stats_lock:
+                        self.stats['errors'] += 1
                     continue
+            
+            # Update global stats
+            with self.stats_lock:
+                self.stats['urban_bodies_processed'] += state_bodies
+                self.stats['wards_extracted'] += state_wards
+                self.stats['skipped'] += state_skipped
+            
+            print(f"🎯 {state_name}: Complete! {state_bodies} bodies, {state_wards} wards extracted")
                     
         except Exception as e:
             self.logger.error(f"Error processing state {state_name}: {str(e)}")
             raise
 
     @retry_on_failure(max_retries=3, delay=1)
-    def get_urban_bodies_from_state(self, state_name: str, state_url: str) -> List[Dict[str, str]]:
+    def get_urban_bodies_from_state(self, state_name: str, state_url: str, session: requests.Session) -> List[Dict[str, str]]:
         """Extract all urban local bodies from a state page"""
         try:
-            response = self.session.get(state_url, timeout=30)
+            response = session.get(state_url, timeout=30)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -217,7 +259,7 @@ class CivicAtlasScraper:
                     district_name = district_link.get_text(strip=True)
                     
                     try:
-                        district_bodies = self.get_urban_bodies_from_district(district_url, district_name)
+                        district_bodies = self.get_urban_bodies_from_district(district_url, district_name, session)
                         urban_bodies.extend(district_bodies)
                         time.sleep(0.5)  # Small delay between district requests
                     except Exception as e:
@@ -274,10 +316,10 @@ class CivicAtlasScraper:
             raise
 
     @retry_on_failure(max_retries=3, delay=1)
-    def get_urban_bodies_from_district(self, district_url: str, district_name: str) -> List[Dict[str, str]]:
+    def get_urban_bodies_from_district(self, district_url: str, district_name: str, session: requests.Session) -> List[Dict[str, str]]:
         """Extract urban bodies from a district page"""
         try:
-            response = self.session.get(district_url, timeout=30)
+            response = session.get(district_url, timeout=30)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -348,10 +390,10 @@ class CivicAtlasScraper:
             return None
 
     @retry_on_failure(max_retries=3, delay=1)
-    def get_wards_from_urban_body(self, urban_body_url: str) -> List[Dict[str, str]]:
+    def get_wards_from_urban_body(self, urban_body_url: str, session: requests.Session) -> List[Dict[str, str]]:
         """Extract ward information from an urban body page"""
         try:
-            response = self.session.get(urban_body_url, timeout=30)
+            response = session.get(urban_body_url, timeout=30)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -447,21 +489,21 @@ class CivicAtlasScraper:
             self.logger.debug(f"Error extracting ward info from cells: {str(e)}")
             return None
 
-    def _initialize_csv_file(self):
-        """Initialize the CSV file with headers"""
+    def _initialize_state_csv_file(self, output_file: str):
+        """Initialize a state-specific CSV file with headers"""
         try:
-            with open(self.output_file, 'w', newline='', encoding='utf-8') as csvfile:
+            with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=self.csv_fieldnames)
                 writer.writeheader()
-            self.logger.info(f"Initialized CSV file: {self.output_file}")
+            self.logger.debug(f"Initialized CSV file: {output_file}")
         except Exception as e:
-            self.logger.error(f"Error initializing CSV file: {str(e)}")
+            self.logger.error(f"Error initializing CSV file {output_file}: {str(e)}")
             raise
 
-    def _save_wards_to_csv(self, wards: List[Dict[str, str]], urban_body: Dict[str, str], state_name: str):
-        """Save ward data to CSV file"""
+    def _save_wards_to_state_csv(self, wards: List[Dict[str, str]], urban_body: Dict[str, str], state_name: str, output_file: str):
+        """Save ward data to state-specific CSV file"""
         try:
-            with open(self.output_file, 'a', newline='', encoding='utf-8') as csvfile:
+            with open(output_file, 'a', newline='', encoding='utf-8') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=self.csv_fieldnames)
                 
                 for ward in wards:
@@ -476,8 +518,39 @@ class CivicAtlasScraper:
                     })
                     
         except Exception as e:
-            self.logger.error(f"Error saving wards to CSV: {str(e)}")
+            self.logger.error(f"Error saving wards to CSV {output_file}: {str(e)}")
             raise
+    
+    def _create_consolidated_file(self):
+        """Create a consolidated CSV file from all state files"""
+        consolidated_file = os.path.join(self.output_dir, "all_states_consolidated.csv")
+        
+        try:
+            print(f"\n🔄 Creating consolidated file: {consolidated_file}")
+            
+            with open(consolidated_file, 'w', newline='', encoding='utf-8') as outfile:
+                writer = csv.DictWriter(outfile, fieldnames=self.csv_fieldnames)
+                writer.writeheader()
+                
+                # Read and combine all state files
+                for filename in os.listdir(self.output_dir):
+                    if filename.endswith('.csv') and filename != 'all_states_consolidated.csv':
+                        state_file = os.path.join(self.output_dir, filename)
+                        
+                        try:
+                            with open(state_file, 'r', encoding='utf-8') as infile:
+                                reader = csv.DictReader(infile)
+                                for row in reader:
+                                    writer.writerow(row)
+                        except Exception as e:
+                            self.logger.warning(f"Error reading {state_file}: {str(e)}")
+                            continue
+            
+            print(f"✅ Consolidated file created: {consolidated_file}")
+            
+        except Exception as e:
+            self.logger.error(f"Error creating consolidated file: {str(e)}")
+            print(f"⚠️  Failed to create consolidated file: {str(e)}")
 
     def display_summary(self):
         """Display summary statistics of the scraping process"""
@@ -488,8 +561,17 @@ class CivicAtlasScraper:
         print(f"Total wards extracted: {self.stats['wards_extracted']}")
         print(f"Errors encountered: {self.stats['errors']}")
         print(f"Bodies skipped (no wards): {self.stats['skipped']}")
-        print(f"Output file: {self.output_file}")
+        print(f"Output directory: {self.output_dir}/")
         
-        if os.path.exists(self.output_file):
-            file_size = os.path.getsize(self.output_file)
-            print(f"File size: {file_size:,} bytes")
+        # Count files and total size
+        total_size = 0
+        file_count = 0
+        if os.path.exists(self.output_dir):
+            for filename in os.listdir(self.output_dir):
+                if filename.endswith('.csv'):
+                    file_path = os.path.join(self.output_dir, filename)
+                    total_size += os.path.getsize(file_path)
+                    file_count += 1
+        
+        print(f"CSV files created: {file_count}")
+        print(f"Total data size: {total_size:,} bytes")
