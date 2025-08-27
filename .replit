@@ -1,2 +1,43 @@
+modules = ["python-3.11"]
 [agent]
 expertMode = true
+integrations = ["web_scraper==1.0.0"]
+
+[nix]
+channel = "stable-25_05"
+packages = ["xcodebuild", "zlib"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "CivicAtlas Scraper"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "install_dependencies"
+
+[[workflows.workflow]]
+name = "CivicAtlas Scraper"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python main.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "install_dependencies"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv add requests beautifulsoup4 lxml"
