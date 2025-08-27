@@ -63,11 +63,11 @@ class CivicAtlasScraper:
             print(f"✅ Found {len(state_urls)} states/UTs")
             
             # Step 2: Process states in parallel
-            print("\n🏛️  Step 2: Processing states in parallel (up to 30 concurrent states)...")
+            print("\n🏛️  Step 2: Processing states in parallel (up to 35 concurrent states)...")
             print(f"📁 Data will be saved to separate files in '{self.output_dir}/' folder\n")
             
             # Use ThreadPoolExecutor for parallel processing
-            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=35) as executor:
                 # Submit all state processing tasks
                 future_to_state = {
                     executor.submit(self.process_state_to_file, state_name, state_url): state_name 
@@ -92,6 +92,9 @@ class CivicAtlasScraper:
             
             # Create consolidated file
             self._create_consolidated_file()
+            
+            # Create completion marker file
+            self._create_done_file()
             
             return True
             
@@ -551,6 +554,23 @@ class CivicAtlasScraper:
         except Exception as e:
             self.logger.error(f"Error creating consolidated file: {str(e)}")
             print(f"⚠️  Failed to create consolidated file: {str(e)}")
+    
+    def _create_done_file(self):
+        """Create a completion marker file"""
+        done_file = os.path.join(self.output_dir, "done")
+        
+        try:
+            with open(done_file, 'w', encoding='utf-8') as f:
+                f.write(f"Scraping completed successfully at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"States processed: {self.stats['states_processed']}\n")
+                f.write(f"Urban bodies processed: {self.stats['urban_bodies_processed']}\n")
+                f.write(f"Total wards extracted: {self.stats['wards_extracted']}\n")
+            
+            print(f"✅ Created completion marker: {done_file}")
+            
+        except Exception as e:
+            self.logger.error(f"Error creating done file: {str(e)}")
+            print(f"⚠️  Failed to create done file: {str(e)}")
 
     def display_summary(self):
         """Display summary statistics of the scraping process"""
