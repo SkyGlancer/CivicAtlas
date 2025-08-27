@@ -63,11 +63,11 @@ class CivicAtlasScraper:
             print(f"✅ Found {len(state_urls)} states/UTs")
             
             # Step 2: Process states in parallel
-            print("\n🏛️  Step 2: Processing states in parallel (up to 5 concurrent states)...")
+            print("\n🏛️  Step 2: Processing states in parallel (up to 30 concurrent states)...")
             print(f"📁 Data will be saved to separate files in '{self.output_dir}/' folder\n")
             
             # Use ThreadPoolExecutor for parallel processing
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
                 # Submit all state processing tasks
                 future_to_state = {
                     executor.submit(self.process_state_to_file, state_name, state_url): state_name 
